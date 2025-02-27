@@ -91,6 +91,7 @@ from pathlib import Path
 import csv
 import logging
 import itertools
+import math
 from time import perf_counter as precision_timestamp
 from datetime import datetime
 from numbers import Number
@@ -108,7 +109,7 @@ from scipy.spatial.distance import pdist, cdist
 from PIL import Image, ImageDraw
 
 _MAGIC_RAND = np.uint64(2654435761)
-_supported_databases = ('bsc5', 'hip_main', 'tyc_main')
+_supported_databases = ('bsc5', 'hip_main', 'tyc_main', 'hip2')
 
 def _insert_at_index(pattern, hash_index, table):
     """Inserts to table with quadratic probing. Returns table index where pattern was inserted."""
@@ -700,7 +701,7 @@ class Tetra3():
 
         catalog_file_full_pathname = Path(__file__).parent / star_catalog
         # Add .dat suffix for hip and tyc if not present
-        if star_catalog in ('hip_main', 'tyc_main') and not catalog_file_full_pathname.suffix:
+        if star_catalog in ('hip_main', 'hip2', 'tyc_main') and not catalog_file_full_pathname.suffix:
             catalog_file_full_pathname = catalog_file_full_pathname.with_suffix('.dat')
 
         assert catalog_file_full_pathname.exists(), 'No star catalogue found at ' \
@@ -741,9 +742,9 @@ class Tetra3():
             if nbent != 32:
                 self._logger.warning('Catalogue %s has unexpected "nbent" header value: %s' %
                                      (star_catalog, nbent))
-        elif star_catalog in ('hip_main', 'tyc_main'):
+        elif star_catalog in ('hip_main', 'hip2', 'tyc_main'):
             num_entries = sum(1 for _ in open(catalog_file_full_pathname))
-            epoch_equinox = 2000
+            epoch_equinox = 2023
             pm_origin = 1991.25
 
         self._logger.info('Loading catalogue %s with %s star entries.' %
@@ -763,7 +764,7 @@ class Tetra3():
         # Preallocate ID table
         if star_catalog == 'bsc5':
             star_catID = np.zeros(num_entries, dtype=np.uint16)
-        elif star_catalog == 'hip_main':
+        elif star_catalog in ['hip_main', 'hip2']:
             star_catID = np.zeros(num_entries, dtype=np.uint32)
         else: #is tyc_main
             star_catID = np.zeros((num_entries, 3), dtype=np.uint16)
@@ -858,14 +859,40 @@ class Tetra3():
                     dec = np.deg2rad(delta + mu_delta * (epoch_proper_motion - pm_origin))
                     star_table[i,:] = ([ra, dec, 0, 0, 0, mag])
                     # Find ID, depends on the database
-                    if star_catalog == 'hip_main':
+                    if star_catalog == 'hip2':
                         star_catID[i] = np.uint32(entry[1])
-                    else: # is tyc_main
-                        star_catID[i, :] = [np.uint16(x) for x in entry[1].split()]
-
                 if incomplete_entries:
                     self._logger.info('Skipped %i incomplete entries.' % incomplete_entries)
-
+        elif star_catalog == 'hip2':
+            with open(catalog_file_full_pathname, 'r') as star_catalog_file:
+                incomplete_entries = 0
+                for (i, line) in enumerate(star_catalog_file):
+                    entry = line.split()
+                                                        
+                    ra_rad = float(entry[4])    # Column 5 - Right Ascension (RA) in ICRS, epoch=1991.25 [rad]
+                    ra_pm = float(entry[7])     # Column 8 - Proper motion in Right Ascension [mas/yr], mas = milli-arc-second
+                    
+                    dec_rad = float(entry[5])   # Column 6 - Declination (DEC) in ICRS, epoch=1991.25 [rad]
+                    dec_pm = float(entry[8])    # Column 9 - Proper motion in Declination [mas/yr], mas = milli-arc-second
+                    
+                    mag = float(entry[19])      # Column 20 - Magnitude
+                    if mag > star_max_magnitude:
+                        continue
+                    
+                    # Right Ascension [rad] @ current epoch
+                    ra = ra_rad + np.deg2rad(ra_pm/np.cos(dec_rad)/1000/60/60 * (epoch_proper_motion - pm_origin))
+                    
+                    # Declination [rad] @ current epoch
+                    dec = dec_rad + np.deg2rad(dec_pm/1000/60/60 * (epoch_proper_motion - pm_origin))
+                    
+                    star_table[i,:] = ([ra, dec, 0, 0, 0, mag])
+                    
+                    # Find ID, depends on the database
+                    if star_catalog  == 'hip2':
+                        star_catID[i] = np.uint32(entry[0])
+                if incomplete_entries:
+                    self._logger.info('Skipped %i incomplete entries.' % incomplete_entries)
+            print(star_table[0, :])
         # Remove entries in which RA and Dec are both zero
         # (i.e. keep entries in which either RA or Dec is non-zero)
         kept = np.logical_or(star_table[:, 0]!=0, star_table[:, 1]!=0)
@@ -874,7 +901,7 @@ class Tetra3():
         star_table = star_table[brightness_ii, :]  # Sort by brightness
         num_entries = star_table.shape[0]
         # Trim and order catalogue ID array to match
-        if star_catalog in ('bsc5', 'hip_main'):
+        if star_catalog in ('bsc5', 'hip_main', 'hip2'):
             star_catID = star_catID[kept][brightness_ii]
         else:
             star_catID = star_catID[kept, :][brightness_ii, :]
@@ -891,7 +918,7 @@ class Tetra3():
             star_table = star_table[kept, :]
             num_entries = star_table.shape[0]
             # Trim down catalogue ID to match
-            if star_catalog in ('bsc5', 'hip_main'):
+            if star_catalog in ('bsc5', 'hip_main', 'hip2'):
                 star_catID = star_catID[kept]
             else:
                 star_catID = star_catID[kept, :]
@@ -906,7 +933,7 @@ class Tetra3():
             star_table = star_table[kept, :]
             num_entries = star_table.shape[0]
             # Trim down catalogue ID to match
-            if star_catalog in ('bsc5', 'hip_main'):
+            if star_catalog in ('bsc5', 'hip_main', 'hip2'):
                 star_catID = star_catID[kept]
             else:
                 star_catID = star_catID[kept, :]
@@ -1029,7 +1056,7 @@ class Tetra3():
         pattern_index = (np.cumsum(keep_for_verifying)-1)
         pattern_list = pattern_index[np.array(list(pattern_list))].tolist()
         # Trim catalogue ID to match
-        if star_catalog in ('bsc5', 'hip_main'):
+        if star_catalog in ('bsc5', 'hip_main', 'hip2'):
             star_catID = star_catID[keep_for_verifying]
         else:
             star_catID = star_catID[keep_for_verifying, :]
@@ -1392,7 +1419,7 @@ class Tetra3():
 
             # Now find the possible range of edge ratio patterns these four image centroids
             # could correspond to.
-            pattlen = int(np.math.factorial(p_size) / 2 / np.math.factorial(p_size - 2) - 1)
+            pattlen = int(math.factorial(p_size) / 2 / math.factorial(p_size - 2) - 1)
             image_pattern_edge_ratio_min = np.ones(pattlen)
             image_pattern_edge_ratio_max = np.zeros(pattlen)
 
